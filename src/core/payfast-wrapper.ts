@@ -1,5 +1,4 @@
-import axios, { Axios, AxiosResponse } from "axios";
-
+import axios from "axios";
 import {
   createGetChecksumHeader,
   createPostPaymentChecksumHeader,
@@ -33,116 +32,95 @@ export class PayFastWrapper {
   constructor(options: PayFastOptions, logger?: Logger) {
     this.logger = logger ?? console;
     this.options = options;
-    switch (this.options.mode) {
-      case "production":
-        this.url = "https://api.payfast.com";
-        break;
-      case "uat":
-        this.url = "https://api.payfast.com";
-        break;
-      case "test":
-      default:
-        this.url = "https://api.payfast.com";
-        break;
-    }
+    this.url = this.resolveUrl(options.mode);
+  }
+
+  private resolveUrl(mode: string): string {
+    const baseUrl = "https://api.payfast.com";
+    return mode === "production" || mode === "uat" ? baseUrl : baseUrl;
+  }
+
+  private createHeaders(checksum: string, additionalHeaders: Record<string, string> = {}): Record<string, string> {
+    return {
+      "Content-Type": "application/json",
+      "X-VERIFY": checksum,
+      ...additionalHeaders,
+    };
   }
 
   async postPaymentRequestToPayfast(
     payload: PaymentRequestUPI | PaymentRequestUPICollect | PaymentRequestUPIQr,
-
-    apiNewEndpoint?: string
+    apiNewEndpoint: string = "/pg/v1/pay"
   ): Promise<PaymentResponse | PaymentProcessorError> {
-    const apiEndpoint = apiNewEndpoint ?? "/pg/v1/pay";
-    const url =
-      /* this.options.mode == "uat"
-        ? "https://api-preprod.payfast.com/apis/pg-sandbox"
-        :*/ this.url;
-
-    const encodedMessage = createPostPaymentChecksumHeader(payload);
-    const headers = {
-      "Content-Type": "application/json",
-      /* accept: "application/json",*/
-      "X-VERIFY": encodedMessage.checksum,
-    };
-    const reqUrl = `${url}${apiEndpoint}`;
-    const result = await axios.post(
-      reqUrl,
-      { request: encodedMessage.encodedBody },
-      {
-        headers,
-      }
-    );
-    return result.data;
+    try {
+      const encodedMessage = createPostPaymentChecksumHeader(payload);
+      const headers = this.createHeaders(encodedMessage.checksum);
+      const response = await axios.post(
+        `${this.url}${apiNewEndpoint}`,
+        { request: encodedMessage.encodedBody },
+        { headers }
+      );
+      return response.data;
+    } catch (error) {
+      this.logger.error("Error posting payment request:", error);
+      throw error;
+    }
   }
 
   validatePaymentRequest(paymentRequest: PaymentRequest): boolean {
-    if (
-      paymentRequest.merchantId.length > 0 &&
-      paymentRequest.merchantId.length < 38
-    ) {
-      if (
-        paymentRequest.merchantTransactionId.length > 0 &&
-        paymentRequest.merchantTransactionId.length < 38
-      ) {
-        if (
-          typeof paymentRequest.amount == "number" &&
-          Number(paymentRequest.amount) === paymentRequest.amount &&
-          !isNaN(paymentRequest.amount)
-        ) {
-          if (
-            paymentRequest.merchantUserId.length > 0 &&
-            paymentRequest.merchantUserId.length < 36 &&
-            paymentRequest.merchantUserId.match(/[^\w]|^_/) == null
-          ) {
-            if (paymentRequest.redirectUrl.includes("http")) {
-              if (paymentRequest.redirectMode) {
-                if (paymentRequest.callbackUrl) {
-                  return true;
-                }
-              }
-            }
-          }
-        }
-      }
-    }
-    return false;
+    const {
+      merchantId,
+      merchantTransactionId,
+      amount,
+      merchantUserId,
+      redirectUrl,
+      redirectMode,
+      callbackUrl,
+    } = paymentRequest;
+
+    return (
+      merchantId.length > 0 && merchantId.length < 38 &&
+      merchantTransactionId.length > 0 && merchantTransactionId.length < 38 &&
+      typeof amount === "number" && !isNaN(amount) &&
+      merchantUserId.length > 0 && merchantUserId.length < 36 &&
+      /^[\w]+$/.test(merchantUserId) &&
+      redirectUrl.startsWith("http") &&
+      !!redirectMode &&
+      !!callbackUrl
+    );
   }
 
   async createPayfastStandardRequest(
     amount: string,
     merchantTransactionId: string,
-    customer_id: string,
+    customerId: string,
     mobileNumber?: string,
     attemptId?: string
   ): Promise<PaymentRequest | PaymentProcessorError> {
     const payFastRequest: PaymentRequest = {
       merchantId: this.options.merchantId,
       redirectMode: this.options.redirectMode,
-      redirectUrl:
-        this.options.redirectUrl?.length == 0
-          ? "https://localhost:8000"
-          : this.options.redirectUrl,
+      redirectUrl: this.options.redirectUrl || "https://localhost:8000",
       merchantTransactionId: `${merchantTransactionId}_${attemptId}`,
-      merchantUserId: customer_id,
-      amount: parseInt(amount),
+      merchantUserId: customerId,
+      amount: parseInt(amount, 10),
       callbackUrl: this.options.callbackUrl,
-      mobileNumber: mobileNumber,
-      paymentInstrument: {
-        type: "PAY_PAGE",
-      },
+      mobileNumber,
+      paymentInstrument: { type: "PAY_PAGE" },
     };
-    const paymentError: PaymentProcessorError = {
-      code: "VALIDATION_FAILED",
-      error: `${JSON.stringify(payFastRequest)} is invalid`,
-    };
+
     return this.validatePaymentRequest(payFastRequest)
       ? payFastRequest
-      : paymentError;
+      : {
+          code: "VALIDATION_FAILED",
+          error: `${JSON.stringify(payFastRequest)} is invalid`,
+        };
   }
+
   async getPayFastTransactionStatus(
     merchantId: string,
     merchantTransactionId: string,
-    apiNewEndpoint?: string
+    apiNewEndpoint: string = "/pg/v1/status"
   ): Promise<PaymentCheckStatusResponse> {
     if (!merchantId || !merchantTransactionId) {
       return {
@@ -150,111 +128,84 @@ export class PayFastWrapper {
           success: false,
           code: PaymentStatusCodeValues.PAYMENT_ERROR,
           message: "merchantId or merchantTransactionId is incomplete",
-          data: undefined,
         },
       } as any;
     }
 
-    const apiEndpoint = apiNewEndpoint ?? "/pg/v1/status";
-    const url =
-      this.options.mode == "uat"
-        ? "https://api-preprod.payfast.com/apis/pg-sandbox"
-        : this.url;
-
-    const encodedMessage = createGetChecksumHeader(
-      merchantId,
-      merchantTransactionId
-    );
-    const headers = {
-      "Content-Type": "application/json",
-      accept: "application/json",
-      "X-VERIFY": encodedMessage.checksum,
-      "X-MERCHANT-ID": merchantId,
-    };
-
-    const requestUrl = `${url}${apiEndpoint}/${merchantId}/${merchantTransactionId}`;
-    const result = await axios.get(requestUrl, {
-      headers,
-    });
-    return result.data;
+    try {
+      const encodedMessage = createGetChecksumHeader(merchantId, merchantTransactionId);
+      const headers = this.createHeaders(encodedMessage.checksum, {
+        "X-MERCHANT-ID": merchantId,
+      });
+      const response = await axios.get(
+        `${this.url}${apiNewEndpoint}/${merchantId}/${merchantTransactionId}`,
+        { headers }
+      );
+      return response.data;
+    } catch (error) {
+      this.logger.error("Error fetching transaction status:", error);
+      throw error;
+    }
   }
 
   async validateVpa(
     merchantId: string,
     vpa: string,
-
-    apiNewEndpoint?: string
+    apiNewEndpoint: string = "/pg/v1/vpa/validate"
   ): Promise<any> {
-    const apiEndpoint = apiNewEndpoint ?? "/pg/v1/vpa/validate";
-    const url = this.url;
-    const encodedMessage = await createPostValidateVpaChecksumHeader({
-      merchantId,
-      vpa,
-    });
-    const headers = {
-      "Content-Type": "application/json",
-      accept: "application/json",
-      "X-VERIFY": encodedMessage.checksum,
-      "X-MERCHANT-ID": merchantId,
-    };
-    const result = await axios.post(
-      `${url}${apiEndpoint}`,
-      { request: encodedMessage.encodedBody },
-      {
-        headers,
-      }
-    );
-    return result.data;
+    try {
+      const encodedMessage = await createPostValidateVpaChecksumHeader({ merchantId, vpa });
+      const headers = this.createHeaders(encodedMessage.checksum, {
+        "X-MERCHANT-ID": merchantId,
+      });
+      const response = await axios.post(
+        `${this.url}${apiNewEndpoint}`,
+        { request: encodedMessage.encodedBody },
+        { headers }
+      );
+      return response.data;
+    } catch (error) {
+      this.logger.error("Error validating VPA:", error);
+      throw error;
+    }
   }
-  async cancel(p: PaymentSessionData): Promise<PaymentSessionData> {
-    p.code = undefined;
-    return p;
+
+  async cancel(paymentSessionData: PaymentSessionData): Promise<PaymentSessionData> {
+    paymentSessionData.code = undefined;
+    return paymentSessionData;
   }
-  async capture(p: PaymentResponseData): Promise<PaymentCheckStatusResponse> {
-    let isCaptured = false;
-    const { merchantId, merchantTransactionId } = p;
 
-    const result = await this.getPayFastTransactionStatus(
-      merchantId,
-      merchantTransactionId
-    );
-
-    isCaptured = result.code != PaymentStatusCodeValues.PAYMENT_PENDING;
-
-    return result;
+  async capture(paymentResponseData: PaymentResponseData): Promise<PaymentCheckStatusResponse> {
+    const { merchantId, merchantTransactionId } = paymentResponseData;
+    return this.getPayFastTransactionStatus(merchantId, merchantTransactionId);
   }
+
   async postRefundRequestToPayFast(
     payload: RefundRequest,
-
-    apiNewEndpoint?: string
+    apiNewEndpoint: string = "/pg/v1/refund"
   ): Promise<any> {
-    const apiEndpoint = apiNewEndpoint ?? "/pg/v1/refund";
-    const url = this.url;
-    const encodedMessage = await createPostRefundChecksumHeader(payload);
-    const headers = {
-      "Content-Type": "application/json",
-      accept: "application/json",
-      "X-VERIFY": encodedMessage.checksum,
-    };
-
-    const result = await axios.post(
-      `${url}${apiEndpoint}`,
-      { request: encodedMessage.encodedBody },
-      {
-        headers,
-      }
-    );
-    return result.data;
+    try {
+      const encodedMessage = await createPostRefundChecksumHeader(payload);
+      const headers = this.createHeaders(encodedMessage.checksum);
+      const response = await axios.post(
+        `${this.url}${apiNewEndpoint}`,
+        { request: encodedMessage.encodedBody },
+        { headers }
+      );
+      return response.data;
+    } catch (error) {
+      this.logger.error("Error posting refund request:", error);
+      throw error;
+    }
   }
+
   validateWebhook(data: string, signature: string, salt: string): boolean {
     const { checksum } = verifyPostCheckSumHeader(data, salt, "");
+    const isValid = checksum === signature;
     this.logger.debug(
-      `verifying checksum received: ${signature}, computed: ${checksum} `
+      `verifying checksum received: ${signature}, computed: ${checksum}`
     );
-    if (checksum == signature) {
-      this.logger.info("checksum valid checksum");
-      return true;
-    }
-    return false;
+    if (isValid) this.logger.info("Valid checksum");
+    return isValid;
   }
 }

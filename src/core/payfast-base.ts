@@ -16,6 +16,7 @@ Step 6. Refund
 import { EOL } from "os";
 import {
   AbstractPaymentProcessor,
+  Customer,
   isPaymentProcessorError,
   PaymentProcessorContext,
   PaymentProcessorError,
@@ -27,6 +28,7 @@ import {
   ErrorCodes,
   ErrorIntentStatus,
   PaymentCheckStatusResponse,
+  PaymentCheckStatusResponseUPIData,
   PaymentIntentOptions,
   PaymentRequest,
   PaymentResponse,
@@ -227,16 +229,16 @@ abstract class PayFastBase extends AbstractPaymentProcessor {
   ): Promise<
     | PaymentProcessorError
     | {
-        status: PaymentSessionStatus;
-        data: PaymentProcessorSessionResponse["session_data"];
-      }
+      status: PaymentSessionStatus;
+      data: PaymentProcessorSessionResponse["session_data"];
+    }
   > {
     try {
       const { merchantId, merchantTransactionId } = paymentSessionData.data as {
         merchantId: string;
         merchantTransactionId: string;
       };
-      const status = await this.checkAuthorisationWithBackOff({
+      const status = await this.checkAuthorizationWithBackOff({
         merchantId,
         merchantTransactionId,
       });
@@ -249,35 +251,21 @@ abstract class PayFastBase extends AbstractPaymentProcessor {
     }
   }
 
-  async checkAuthorisationWithBackOff(
-    t: TransactionIdentifier
+  async checkAuthorizationWithBackOff(
+    identifier: TransactionIdentifier
   ): Promise<PaymentSessionStatus> {
-    try {
-      return await this.retryFunction(t, 3e3, 10);
-    } catch (err) {
-      if (isTooManyTries(err)) {
-        try {
-          return await this.retryFunction(t, 6e3, 10);
-        } catch (err) {
-          if (isTooManyTries(err)) {
-            try {
-              return await this.retryFunction(t, 10e3, 6);
-            } catch (err) {
-              if (isTooManyTries(err)) {
-                try {
-                  return await this.retryFunction(t, 30e3, 2);
-                } catch (err) {
-                  if (isTooManyTries(err)) {
-                    return await this.retryFunction(t, 60e3, 15);
-                  }
-                  return PaymentSessionStatus.PENDING;
-                }
-              }
-            }
-          }
+    const retryDelays = [3000, 6000, 10000, 30000, 60000];
+
+    for (const delay of retryDelays) {
+      try {
+        return await this.retryFunction(identifier, delay, 10);
+      } catch (error) {
+        if (!isTooManyTries(error)) {
+          throw error;
         }
       }
     }
+
     return PaymentSessionStatus.ERROR;
   }
 
@@ -297,6 +285,14 @@ abstract class PayFastBase extends AbstractPaymentProcessor {
         until: (lastResult) => lastResult === PaymentSessionStatus.AUTHORIZED,
       }
     );
+  }
+
+  async deletePayment(
+    paymentSessionData: Record<string, unknown>
+  ): Promise<
+    PaymentProcessorError | PaymentProcessorSessionResponse["session_data"]
+  > {
+    return await this.cancelPayment(paymentSessionData);
   }
 
   async cancelPayment(
@@ -324,11 +320,7 @@ abstract class PayFastBase extends AbstractPaymentProcessor {
     PaymentProcessorError | PaymentProcessorSessionResponse["session_data"]
   > {
     try {
-      const intent = await this.payfast_
-      .capture(
-        paymentSessionData.data as PaymentResponseData
-      );
-      // this.logger.info(`result of capture : ${JSON.stringify(intent)}`);
+      const intent = await this.payfast_.capture(paymentSessionData.data as PaymentResponseData);
       return intent as unknown as PaymentProcessorSessionResponse["session_data"];
     } catch (error) {
       if (error.code === ErrorCodes.PAYMENT_INTENT_UNEXPECTED_STATE) {
@@ -341,39 +333,24 @@ abstract class PayFastBase extends AbstractPaymentProcessor {
     }
   }
 
-  async deletePayment(
-    paymentSessionData: Record<string, unknown>
-  ): Promise<
-    PaymentProcessorError | PaymentProcessorSessionResponse["session_data"]
-  > {
-    return await this.cancelPayment(paymentSessionData);
-  }
-
-  async refundPayment(
+  async refundPayment(  
     paymentSessionData: Record<string, unknown>,
     refundAmount: number
   ): Promise<
     PaymentProcessorError | PaymentProcessorSessionResponse["session_data"]
   > {
-    const pastSession =
-      paymentSessionData.data as unknown as PaymentResponseData;
+    const pastSession = paymentSessionData.data as PaymentResponseData;
     const refundRequest: RefundRequest = {
       merchantId: pastSession.merchantId,
-
       originalTransactionId: pastSession.merchantTransactionId,
-
       amount: refundAmount,
-
-      merchantTransactionId:
-        (paymentSessionData.data as any).merchantTransactionId + "1",
+      merchantTransactionId: (paymentSessionData.data as any).merchantTransactionId + "1",
       callbackUrl: `${this.options_.callbackUrl}/hooks/refund`,
-      merchantUserId: (paymentSessionData as any).customer.id,
+      merchantUserId: (paymentSessionData as any).customer?.id,
     };
 
     try {
-      const response = await this.payfast_.postRefundRequestToPayFast(
-        refundRequest
-      );
+      const response = await this.payfast_.postRefundRequestToPayFast(refundRequest);
       if (this.options_.enabledDebugLogging) {
         this.logger.info(`response from payfast: ${JSON.stringify(response)}`);
       }
@@ -382,10 +359,8 @@ abstract class PayFastBase extends AbstractPaymentProcessor {
       this.logger.error(`response from payfast: ${JSON.stringify(e)}`);
       return this.buildError("An error occurred in refundPayment", e);
     }
-
-    return paymentSessionData;
   }
-
+ 
   async retrievePayment(
     paymentSessionData: Record<string, unknown>
   ): Promise<
@@ -410,8 +385,6 @@ abstract class PayFastBase extends AbstractPaymentProcessor {
   async updatePayment(
     context: PaymentProcessorContext
   ): Promise<PaymentProcessorError | PaymentProcessorSessionResponse | void> {
-    /** payfast doesn't allow you to update an ongoing payment, you need to initiate new one */
-    /* if (payfast !== (paymentSessionData.customer as Customer).id) {*/
     this.logger.info(
       `update request context from medusa: ${JSON.stringify(context)}`
     );
@@ -429,34 +402,11 @@ abstract class PayFastBase extends AbstractPaymentProcessor {
       );
     } else {
       return data as any;
-      /* return this.buildError(
-    "unsupported by payfast",
-    new Error("unable to update payment data")
-  );*/
     }
-
-    // Prevent from updating the amount from here as it should go through
-    // the updatePayment method to perform the correct logic
-    /* if (data.amount) {
-      throw new MedusaError(
-        MedusaError.Types.INVALID_DATA,
-        "Cannot update amount, use updatePayment instead"
-      );
-
-      return this.buildError("An error occurred in updatePaymentData", e);
-``    }*/
   }
 
-  /**
-   * Constructs payfast Webhook event
-   * @param {string} encodedData - encoded string
-   * @param {object} signature - the payfast signature on the event, that
-   *    ensures integrity of the webhook event
-   * @return {Object} payfast Webhook event
-   */
   constructWebhookEvent(encodedData: string, signature: string): PayFastEvent {
     const decodedBody = JSON.parse(atob(encodedData)) as PayFastS2SResponse;
-    console.log(decodedBody);
     if (
       this.payfast_.validateWebhook(encodedData, signature, this.options_.salt)
     ) {
@@ -473,7 +423,7 @@ abstract class PayFastBase extends AbstractPaymentProcessor {
         id: decodedBody.data?.merchantTransactionId ?? "error_id",
         data: {
           object: this.buildError(
-            "PayFastError",
+            "Webhook validation error",
             new Error("error validating data")
           ) as any,
         },
@@ -481,15 +431,13 @@ abstract class PayFastBase extends AbstractPaymentProcessor {
     }
   }
 
-  protected buildError(message: string, e: Error): PaymentProcessorError {
+  protected buildError(message: string, error: Error): PaymentProcessorError {
     return {
       error: message,
-      code: isPaymentProcessorError(e) ? e.code : e.name,
-      detail: isPaymentProcessorError(e)
-        ? `${e.error}${EOL}${e.detail ?? ""}`
-        : "detail" in e
-        ? e.detail
-        : e.message ?? "",
+      code: isPaymentProcessorError(error) ? error.code : error.name,
+      detail: isPaymentProcessorError(error)
+        ? `${error.error}${EOL}${error.detail || ""}`
+        : error.message || "",
     };
   }
 }
