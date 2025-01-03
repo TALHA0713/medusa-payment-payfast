@@ -16,7 +16,6 @@ Step 6. Refund
 import { EOL } from "os";
 import {
   AbstractPaymentProcessor,
-  Customer,
   isPaymentProcessorError,
   PaymentProcessorContext,
   PaymentProcessorError,
@@ -28,7 +27,6 @@ import {
   ErrorCodes,
   ErrorIntentStatus,
   PaymentCheckStatusResponse,
-  PaymentCheckStatusResponseUPIData,
   PaymentIntentOptions,
   PaymentRequest,
   PaymentResponse,

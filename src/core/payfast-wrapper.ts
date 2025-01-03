@@ -35,14 +35,14 @@ export class PayFastWrapper {
     this.options = options;
     switch (this.options.mode) {
       case "production":
-        this.url = "https://api.payfast.com/apis/hermes";
+        this.url = "https://api.payfast.com";
         break;
       case "uat":
-        this.url = "https://api-preprod.payfast.com/apis/hermes";
+        this.url = "https://api.payfast.com";
         break;
       case "test":
       default:
-        this.url = "https://api-preprod.payfast.com/apis/pg-sandbox";
+        this.url = "https://api.payfast.com";
         break;
     }
   }
